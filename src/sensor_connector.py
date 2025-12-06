@@ -17,6 +17,8 @@ class SensorConnector:
         sleep(5)
         self.scanner.stop()
         sensorsInfo = self.scanner.sensors()
+        
+        print("Stop resistance")
         for i in range(len(sensorsInfo)):
             if sensorsInfo[i].Address != self.known_busy_address:
                 print(f"Skipping known busy device {sensorsInfo[i]}")
@@ -28,6 +30,10 @@ class SensorConnector:
             sensor.batteryChanged = self.event_handler.on_battery_changed
             sensor.signalDataReceived = self.event_handler.on_signal_received
             sensor.resistDataReceived = self.event_handler.on_resist_received
+            sensor.exec_command(SensorCommand.StartResist)
+            print("Start resistance")
+            sleep(10)
+            sensor.exec_command(SensorCommand.StopResist)
             if sensor.is_supported_command(SensorCommand.StartSignal):
                 print("Нажмите Alt для СТАРТА сигнала...")
                 keyboard.wait('alt')
