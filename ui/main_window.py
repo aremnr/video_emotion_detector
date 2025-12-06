@@ -62,10 +62,10 @@ class MainWindow(QWidget):
         left.addWidget(self.video, stretch=1)
 
         # Кнопка старта/остановки EEG сессии
-        # self.session_btn = QPushButton("Start EEG Session")
-        # self.session_btn.setFixedHeight(32)
-        # self.session_btn.clicked.connect(self.toggle_session)
-        # left.addWidget(self.session_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.session_btn = QPushButton("Start EEG Session")
+        self.session_btn.setFixedHeight(32)
+        self.session_btn.clicked.connect(self.toggle_session)
+        left.addWidget(self.session_btn, alignment=Qt.AlignmentFlag.AlignLeft)
 
         # -------- RIGHT PANEL (GRAPH) --------
         right = QVBoxLayout()
@@ -83,7 +83,7 @@ class MainWindow(QWidget):
         self.video.graph = self.graph
 
         # Флаг состояния сессии
-        #self.session_active = False
+        self.session_active = False
 
     # -------------------------------
     # LOAD VIDEO
@@ -107,27 +107,27 @@ class MainWindow(QWidget):
         self.graph.add_external_value(value)
         self.video.update_heatmap_from_value(value)
 
-    # def toggle_session(self):
-    #     if not self.session_active:
-    #         # Старт сессии
-    #         try:
-    #             self.connector.start_signal_from_ui()
-    #             self.session_btn.setText("Stop EEG Session")
-    #             self.session_active = True
-    #             self.status_label.setText("EEG: ONLINE")
-    #             self.status_label.setStyleSheet("color: green; font-size: 12px;")
-    #         except Exception as e:
-    #             print(f"Cannot start EEG session: {e}")
-    #     else:
-    #         # Стоп сессии
-    #         try:
-    #             self.connector.stop_signal_from_ui()
-    #             self.session_btn.setText("Start EEG Session")
-    #             self.session_active = False
-    #             self.status_label.setText("EEG: OFFLINE")
-    #             self.status_label.setStyleSheet("color: red; font-size: 12px;")
-    #         except Exception as e:
-    #             print(f"Cannot stop EEG session: {e}")
+    def toggle_session(self):
+        if not self.session_active:
+            # Старт сессии
+            try:
+                self.connector.start_signal_from_ui()
+                self.session_btn.setText("Stop EEG Session")
+                self.session_active = True
+                self.status_label.setText("EEG: ONLINE")
+                self.status_label.setStyleSheet("color: green; font-size: 12px;")
+            except Exception as e:
+                print(f"Cannot start EEG session: {e}")
+        else:
+            # Стоп сессии
+            try:
+                self.connector.stop_signal_from_ui()
+                self.session_btn.setText("Start EEG Session")
+                self.session_active = False
+                self.status_label.setText("EEG: OFFLINE")
+                self.status_label.setStyleSheet("color: red; font-size: 12px;")
+            except Exception as e:
+                print(f"Cannot stop EEG session: {e}")
 
 
 
