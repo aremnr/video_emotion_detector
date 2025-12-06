@@ -1,7 +1,7 @@
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel
-from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtCore import Qt
 import pyqtgraph as pg
-import random
+
 
 class EngagementGraph(QWidget):
     def __init__(self, parent=None):
@@ -10,62 +10,73 @@ class EngagementGraph(QWidget):
         # --- Layout ---
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0,0,0,0)
+
         self.plot_widget = pg.PlotWidget()
         layout.addWidget(self.plot_widget)
 
-        # --- Настройка графика ---
-        #self.plot_widget.setBackground('w')  # белое поле
-        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)  # лёгкая сетка
+        # --- Настройки графика ---
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self.plot_widget.setYRange(0, 100)
         self.plot_widget.setXRange(0, 200)
 
         # Линия графика
-        self.plot = self.plot_widget.plot([], pen=pg.mkPen(color=(0, 200, 255), width=2), antialias=True)
+        self.plot = self.plot_widget.plot(
+            [],
+            pen=pg.mkPen(color=(0, 200, 255), width=2),
+            antialias=True
+        )
 
-        # --- Метка текущей вовлеченности ---
+        # Подпись текущего значения
         self.engagement_label = QLabel("Current engagement: 0%")
         self.engagement_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.engagement_label.setStyleSheet("font-weight: bold; color: #0040c0; font-size: 13px;")
+        self.engagement_label.setStyleSheet(
+            "font-weight: bold; color: #0040c0; font-size: 13px;"
+        )
         layout.addWidget(self.engagement_label)
 
         # Данные
         self.data = []
-        self.max_points = 200
-
-        # Таймер обновления
-        self.timer = QTimer()
-        self.timer.setInterval(300)  # каждые 100 мс
-        self.timer.timeout.connect(self.update_graph)
-        self.timer.start()
+        self.max_points = 10000
 
         # Параметр сглаживания
-        self.alpha = 0.2  # чем меньше, тем плавнее
+        self.alpha = 0.2
 
-    # --- Обновление графика ---
-    def update_graph(self):
-        new_raw = random.randint(0, 100)
+    # ----------------------------------------
+    # 🔥 Метод для получения реальных значений
+    # вызывается из MainWindow.on_engagement_update()
+    # ----------------------------------------
+    def add_external_value(self, value):
+        raw = value * 100
 
-        # сглаживание с предыдущим значением
-        last_value = self.data[-1] if self.data else 50
-        new_value = self.alpha * new_raw + (1 - self.alpha) * last_value
+        # сглаживание
+        last = self.data[-1] if self.data else 50
+        smooth = self.alpha * raw + (1 - self.alpha) * last
 
-        self.data.append(new_value)
+        # обновление массива
+        self.data.append(smooth)
         if len(self.data) > self.max_points:
             self.data.pop(0)
 
-        # обновляем линию
+        # обновление графика
         self.plot.setData(self.data)
 
-        # обновляем метку под графиком
-        self.engagement_label.setText(f"Current engagement: {int(new_value)}%")
+        # 🎯 --- АВТОПРОКРУТКА X ---
+        visible_width = 200  # сколько секунд видно в окне
+        n = len(self.data)
 
-    # --- Получить все данные ---
-    def get_data(self):
-        return self.data
+        if n > visible_width:
+            self.plot_widget.setXRange(n - visible_width, n)
+        else:
+            self.plot_widget.setXRange(0, visible_width)
 
-    # --- Последнее значение для heatmap ---
+        # подпись
+        self.engagement_label.setText(f"Current engagement: {int(smooth)}%")
+
     def get_latest_value(self):
         if not self.data:
-            return 0.5  # если нет данных, середина
+            return 0.5
         val = self.data[-1]
         return min(1.0, max(0.0, val / 100.0))
+
+    def get_data(self):
+        return self.data

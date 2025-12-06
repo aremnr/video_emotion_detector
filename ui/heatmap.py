@@ -18,6 +18,21 @@ class HeatmapWidget(QWidget):
         self.current_pos = pos
         self.update()
 
+    def set_value(self, v):
+        """Добавляет новое значение вовлеченности в массив и обновляет отображение."""
+        # Ограничиваем длину массива, чтобы не разрастался бесконечно
+        MAX_POINTS = 500
+
+        self.data.append(v)
+
+        if len(self.data) > MAX_POINTS:
+            self.data.pop(0)
+
+        # текущая позиция всегда последняя точка
+        self.current_pos = len(self.data) - 1
+
+        self.update()
+
     def value_to_color(self, v):
         """Преобразует значение 0..1 в цвет heatmap."""
         if v is None:

@@ -13,7 +13,7 @@ import mpv
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QSlider, QLabel
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QWindow
-from heatmap import HeatmapWidget
+from ui.heatmap import HeatmapWidget
 import random
 
 class VideoWidget(QWidget):
@@ -164,3 +164,7 @@ class VideoWidget(QWidget):
             value = self.progress.value()
             new_time = (value / 1000) * self.player.duration
             self.player.seek(new_time, reference="absolute")
+
+    def update_heatmap_from_value(self, value):
+        if self.heatmap:
+            self.heatmap.set_value(value)
