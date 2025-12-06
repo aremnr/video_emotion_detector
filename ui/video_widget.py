@@ -1,5 +1,4 @@
 import os
-import sys
 
 dll_dir = os.path.abspath(os.path.dirname(__file__))
 
@@ -12,9 +11,7 @@ os.add_dll_directory(dll_dir)
 import mpv
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QSlider, QLabel
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QWindow
 from ui.heatmap import HeatmapWidget
-import random
 
 class VideoWidget(QWidget):
     def __init__(self, parent=None):
