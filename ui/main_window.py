@@ -1,4 +1,6 @@
 import sys
+import datetime
+import os
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QFileDialog, QLabel
@@ -16,6 +18,10 @@ from backend.src.emotion_math_manager import EmotionMathManager
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
+
+        self.global_min = 999
+        self.global_max = -999
+        self.log_path = None
 
         self.setWindowTitle("BrainBit Engagement Tracker")
         self.setMinimumSize(1300, 720)
@@ -107,6 +113,37 @@ class MainWindow(QWidget):
         self.graph.add_external_value(value)
         self.video.update_heatmap_from_value(value)
 
+        if not self.session_active:
+            return
+
+        current = self.graph.get_latest_value() * 100
+        timestamp = self.get_video_timestamp()
+
+        if current < 10:
+            self.log_event(f"[LOW] {timestamp}s  → {current:.1f}%\n")
+
+        if current > 50:
+            self.log_event(f"[HIGH] {timestamp}s → {current:.1f}%\n")
+
+        if current < self.global_min:
+            self.global_min = current
+            self.log_event(f"[NEW GLOBAL MIN] {timestamp}s → {current:.1f}%\n")
+
+        if current > self.global_max:
+            self.global_max = current
+            self.log_event(f"[NEW GLOBAL MAX] {timestamp}s → {current:.1f}%\n")
+
+
+    def log_event(self, text: str):
+        if not self.log_path:
+            return
+        try:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(text)
+        except Exception as e:
+            print(f"LOG ERROR: {e}")
+
+
     def toggle_session(self):
         if not self.session_active:
             # Старт сессии
@@ -116,6 +153,21 @@ class MainWindow(QWidget):
                 self.session_active = True
                 self.status_label.setText("EEG: ONLINE")
                 self.status_label.setStyleSheet("color: green; font-size: 12px;")
+
+                # --- СОЗДАТЬ НОВЫЙ ЛОГ-ФАЙЛ ---
+                ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                logs_dir = "session_logs"
+                os.makedirs(logs_dir, exist_ok=True)
+                self.log_path = os.path.join(logs_dir, f"session_{ts}.txt")
+
+                with open(self.log_path, "w", encoding="utf-8") as f:
+                    f.write("=== EEG SESSION STARTED ===\n")
+                    f.write(f"Created: {ts}\n\n")
+
+                # сброс глобальных минимумов/максимумов
+                self.global_min = 999
+                self.global_max = -999
+
             except Exception as e:
                 print(f"Cannot start EEG session: {e}")
         else:
@@ -126,8 +178,26 @@ class MainWindow(QWidget):
                 self.session_active = False
                 self.status_label.setText("EEG: OFFLINE")
                 self.status_label.setStyleSheet("color: red; font-size: 12px;")
+
+                # финальный лог
+                if self.log_path:
+                    with open(self.log_path, "a", encoding="utf-8") as f:
+                        f.write("=== SESSION ENDED ===\n")
+
             except Exception as e:
                 print(f"Cannot stop EEG session: {e}")
+
+
+    def get_video_timestamp(self):
+        try:
+            if not self.video or not self.video.player:
+                return 0
+            # проверяем, есть ли свойство position
+            if not hasattr(self.video.player, "position"):
+                return 0
+            return round(self.video.player.position() / 1000, 2)
+        except Exception:
+            return 0
 
 
 

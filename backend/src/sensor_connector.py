@@ -8,6 +8,7 @@ class SensorConnector:
         self.event_handler = event_handler
         self.math_manager = math_manager
         self.known_busy_address = known_busy_address
+        #self.scanner = Scanner([SensorFamily.LEBrainBit, SensorFamily.LEBrainBitBlack])
         self.scanner = None
         self.active_sensor = None
 
@@ -17,7 +18,7 @@ class SensorConnector:
             self.scanner.sensorsChanged = self.event_handler.sensor_found
         self.scanner.start()
         print("Starting search for sensors...")
-        sleep(5)
+        sleep(10)
         self.scanner.stop()
         sensorsInfo = self.scanner.sensors()
         print("Search finished")

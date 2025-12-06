@@ -1,6 +1,7 @@
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel
 from PyQt6.QtCore import Qt
 import pyqtgraph as pg
+import time
 
 
 class EngagementGraph(QWidget):
@@ -13,6 +14,9 @@ class EngagementGraph(QWidget):
 
         self.plot_widget = pg.PlotWidget()
         layout.addWidget(self.plot_widget)
+
+        self.plot_widget.disableAutoRange()
+        self.last_update = 0
 
         # --- Настройки графика ---
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
@@ -42,7 +46,7 @@ class EngagementGraph(QWidget):
         self.alpha = 0.2
 
     # ----------------------------------------
-    # 🔥 Метод для получения реальных значений
+    # Метод для получения реальных значений
     # вызывается из MainWindow.on_engagement_update()
     # ----------------------------------------
     def add_external_value(self, value):
@@ -57,17 +61,22 @@ class EngagementGraph(QWidget):
         if len(self.data) > self.max_points:
             self.data.pop(0)
 
-        # обновление графика
-        self.plot.setData(self.data)
+        # --- стабильное обновление графика (не чаще 60 FPS) ---
+        now = time.time()
+        if now - self.last_update < 1/60:
+            return
+        self.last_update = now
 
-        # 🎯 --- АВТОПРОКРУТКА X ---
-        visible_width = 200  # сколько секунд видно в окне
+        self.plot.setData(self.data, clear=False)
+
+        # --- стабильно работающая автопрокрутка ---
         n = len(self.data)
+        visible_width = 200
 
         if n > visible_width:
-            self.plot_widget.setXRange(n - visible_width, n)
+            self.plot_widget.setXRange(n - visible_width, n, padding=0)
         else:
-            self.plot_widget.setXRange(0, visible_width)
+            self.plot_widget.setXRange(0, visible_width, padding=0)
 
         # подпись
         self.engagement_label.setText(f"Current engagement: {int(smooth)}%")
