@@ -32,11 +32,26 @@ def on_signal_received(sensor, data):
     math.process_data_arr()
     # print("Artifacted: both sides - {0}, sequence - {1}".format(math.is_both_sides_artifacted(), math.is_artifacted_sequence()))
     if not math.calibration_finished():
-        print("Calibration percents: {0}".format(math.get_calibration_percents()))
+        calib_percent = math.get_calibration_percents()
+        bar_length = int(calib_percent / 5)
+        bar = '█' * bar_length + '░' * (20 - bar_length)
+        print(f"Calibration: |{bar}| {calib_percent:.1f}%")
     else:
         mental_data = math.read_mental_data_arr()
         if len(mental_data) > 0:
-            print("Mental data: {0}".format(mental_data[0].rel_relaxation))
+            r_relaxation = mental_data[0].rel_relaxation
+            r_attention = mental_data[0].rel_attention
+            relaxation = mental_data[0].inst_relaxation
+            attention = mental_data[0].inst_attention
+            bar_length = int(r_relaxation / 5)
+            bar_length_2 = int(r_attention / 5)
+            bar_length_3 = int(attention / 5)
+            bar_length_4 = int(relaxation / 5)
+            bar = '█' * bar_length + '░' * (20 - bar_length)
+            bar2 = '█' * bar_length_2 + '░' * (20 - bar_length_2)
+            bar3 = '█' * bar_length_3 + '░' * (20 - bar_length_3)
+            bar4 = '█' * bar_length_4 + '░' * (20 - bar_length_4)
+            print(f"R_Attention:   |{bar2}| {r_attention:.1f}% R_Relaxation:  |{bar}| {r_relaxation:.1f}% Relaxation:   |{bar4}| {relaxation:.1f}% Attention:    |{bar3}| {attention:.1f}%")
         spectral_data = math.read_spectral_data_percents_arr()
         if len(spectral_data) > 0:
             #print("Spectral data: {0}".format(spectral_data))
@@ -58,7 +73,9 @@ try:
 
     sensorsInfo = scanner.sensors()
     for i in range(len(sensorsInfo)):
-
+        if sensorsInfo[i].Address != "C8:E6:24:1C:EA:D8":
+            print("Skipping known busy device {0}".format(sensorsInfo[i]))
+            continue
         # connect to device
         current_sensor_info = sensorsInfo[i]
         # create_sensor is a blocking method, so its execution should preferably be placed in a separate thread 
