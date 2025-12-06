@@ -10,6 +10,36 @@ import wave
 import numpy as np
 import concurrent.futures
 from datetime import datetime
+from dataclasses import dataclass
+
+# --- LOCAL DATACLASS DEFINITIONS ---
+@dataclass
+class MathLibSetting:
+    sampling_rate: int = 250
+    process_win_freq: int = 25
+    fft_window: int = 1000
+    n_first_sec_skipped: int = 4
+    bipolar_mode: bool = True
+    channels_number: int = 4
+    channel_for_analysis: int = 0
+
+@dataclass
+class ArtifactDetectSetting:
+    art_bord: int = 110
+    allowed_percent_artpoints: int = 70
+    raw_betap_limit: int = 800000
+    total_pow_border: int = 100
+    global_artwin_sec: int = 4
+    spect_art_by_totalp: bool = False
+    hanning_win_spectrum: bool = False
+    hamming_win_spectrum: bool = False
+    num_wins_for_quality_avg: int = 100
+
+@dataclass
+class MentalAndSpectralSetting:
+    n_sec_for_instant_estimation: int = 2
+    n_sec_for_averaging: int = 2
+
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -26,7 +56,6 @@ from moviepy.video.io.VideoFileClip import VideoFileClip
 from moviepy.audio.io.AudioFileClip import AudioFileClip
 from moviepy.video.compositing.CompositeVideoClip import concatenate_videoclips
 
-# Попытка импорта speedx для разных версий
 try:
     from moviepy.video.fx.all import speedx
 except ImportError:
@@ -73,10 +102,14 @@ try:
     from neurosdk.cmn_types import *
     from neurosdk.brainbit_sensor import BrainBitSensor
     from em_st_artifacts.emotional_math import EmotionalMath
-    from em_st_artifacts.utils.lib_settings import (
-        MathLibSetting, ArtifactDetectSetting,
-        MentalAndSpectralSetting, ShortArtifactDetectSetting
-    )
+    try:
+        from em_st_artifacts.utils.lib_settings import (
+            MathLibSetting, ArtifactDetectSetting,
+            MentalAndSpectralSetting
+        )
+    except ImportError:
+        pass 
+        
     from em_st_artifacts.utils.support_classes import RawChannels
     SDK_LOADED = True
 except ImportError as e:
@@ -376,12 +409,11 @@ class DebugWorker(QThread):
 
             # Data Callbacks
             def on_signal_received(sensor, data):
-                # Just logging length to avoid spam
                 pass 
-                # log(f"Signal packet: {len(data)} samples")
 
             def on_resist_received(sensor, data):
-                 log(f"Resist: O1={data[0].O1}, O2={data[0].O2}, T3={data[0].T3}, T4={data[0].T4}")
+                 # ИСПРАВЛЕНИЕ ЗДЕСЬ: data - это объект, а не массив
+                 log(f"Resist: O1={data.O1}, O2={data.O2}, T3={data.T3}, T4={data.T4}")
 
             def on_mems_received(sensor, data):
                  log(f"MEMS: {data}")
@@ -398,27 +430,29 @@ class DebugWorker(QThread):
             # --- TEST SEQUENCE ---
             
             # 1. Signal
-            if sensor.is_supported_command(SensorCommand.CommandStartSignal):
-                log(">>> STARTING SIGNAL (5s)... check console/internals")
-                sensor.exec_command(SensorCommand.CommandStartSignal)
+            if sensor.is_supported_command(SensorCommand.StartSignal):
+                log(">>> STARTING SIGNAL (5s)...")
+                sensor.exec_command(SensorCommand.StartSignal)
                 time.sleep(5)
-                sensor.exec_command(SensorCommand.CommandStopSignal)
+                sensor.exec_command(SensorCommand.StopSignal)
                 log(">>> STOPPED SIGNAL")
+            else:
+                log("Signal command not supported")
             
             # 2. Resist
-            if sensor.is_supported_command(SensorCommand.CommandStartResist):
+            if sensor.is_supported_command(SensorCommand.StartResist):
                 log(">>> STARTING RESIST (5s)...")
-                sensor.exec_command(SensorCommand.CommandStartResist)
+                sensor.exec_command(SensorCommand.StartResist)
                 time.sleep(5)
-                sensor.exec_command(SensorCommand.CommandStopResist)
+                sensor.exec_command(SensorCommand.StopResist)
                 log(">>> STOPPED RESIST")
 
             # 3. MEMS
-            if sensor.is_supported_command(SensorCommand.CommandStartMEMS):
+            if sensor.is_supported_command(SensorCommand.StartMEMS):
                 log(">>> STARTING MEMS (3s)...")
-                sensor.exec_command(SensorCommand.CommandStartMEMS)
+                sensor.exec_command(SensorCommand.StartMEMS)
                 time.sleep(3)
-                sensor.exec_command(SensorCommand.CommandStopMEMS)
+                sensor.exec_command(SensorCommand.StopMEMS)
                 log(">>> STOPPED MEMS")
 
             sensor.disconnect()
@@ -458,7 +492,6 @@ class BrainBitWorker(QThread):
             n_first_sec_skipped=4,
             fft_window=1000,
             bipolar_mode=True,
-            squared_spectrum=True,
             channels_number=4,
             channel_for_analysis=0 
         )
@@ -476,20 +509,14 @@ class BrainBitWorker(QThread):
             spect_art_by_totalp=True
         )
 
-        # 3. Short Artifact Settings
-        sads = ShortArtifactDetectSetting(
-            ampl_art_detect_win_size=200,
-            ampl_art_zerod_area=200,
-            ampl_art_extremum_border=25
-        )
-
         # 4. Mental Settings
         mss = MentalAndSpectralSetting(
             n_sec_for_averaging=2,
             n_sec_for_instant_estimation=4
         )
         
-        math = EmotionalMath(mls, ads, sads, mss)
+        # Init without sads
+        math = EmotionalMath(mls, ads, mss)
         
         math.set_calibration_length(6)
         math.set_mental_estimation_mode(False)
@@ -561,7 +588,8 @@ class BrainBitWorker(QThread):
                     print(f"Data error: {e}")
 
             self.sensor.signalDataReceived = on_data_received
-            self.sensor.exec_command(SensorCommand.CommandStartSignal)
+            
+            self.sensor.exec_command(SensorCommand.StartSignal)
             
             while self.is_running:
                 time.sleep(1)
@@ -575,7 +603,7 @@ class BrainBitWorker(QThread):
     def cleanup(self):
         if self.sensor:
             try:
-                self.sensor.exec_command(SensorCommand.CommandStopSignal)
+                self.sensor.exec_command(SensorCommand.StopSignal)
                 self.sensor.disconnect()
             except: pass
             self.sensor = None
@@ -759,9 +787,9 @@ class ScreenRecorderWorker(QThread):
                         print(f"Audio clip load error: {e}")
 
                 if final_audio:
-                     final_clip = safe_set_audio(video_clip, final_audio)
+                      final_clip = safe_set_audio(video_clip, final_audio)
                 else:
-                     final_clip = video_clip
+                      final_clip = video_clip
 
                 final_clip.write_videofile(out_file, codec='libx264', audio_codec='aac', logger=None)
                 
