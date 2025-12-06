@@ -19,8 +19,13 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
 
+        self.low_period = None      # (start_timestamp, cumulative_value, count)
+        self.high_period = None     # (start_timestamp, cumulative_value, count)
         self.global_min = 999
         self.global_max = -999
+        self.global_min_timestamp = None
+        self.global_max_timestamp = None
+
         self.log_path = None
 
         self.setWindowTitle("BrainBit Engagement Tracker")
@@ -120,18 +125,38 @@ class MainWindow(QWidget):
         timestamp = self.get_video_timestamp()
 
         if current < 10:
-            self.log_event(f"[LOW] {timestamp}s  → {current:.1f}%\n")
+            if self.low_period is None:
+                self.low_period = [timestamp, current, 1]  # start, cumulative_value, count
+            else:
+                self.low_period[1] += current
+                self.low_period[2] += 1
+        else:
+            if self.low_period:
+                start, cum, cnt = self.low_period
+                avg = cum / cnt
+                self.log_event(f"[LOW] {start:.2f}s - {timestamp:.2f}s -> {avg:.1f}%\n")
+                self.low_period = None
 
-        if current > 50:
-            self.log_event(f"[HIGH] {timestamp}s → {current:.1f}%\n")
+        if current > 70:
+            if self.high_period is None:
+                self.high_period = [timestamp, current, 1]
+            else:
+                self.high_period[1] += current
+                self.high_period[2] += 1
+        else:
+            if self.high_period:
+                start, cum, cnt = self.high_period
+                avg = cum / cnt
+                self.log_event(f"[HIGH] {start:.2f}s - {timestamp:.2f}s -> {avg:.1f}%\n")
+                self.high_period = None
 
         if current < self.global_min:
             self.global_min = current
-            self.log_event(f"[NEW GLOBAL MIN] {timestamp}s → {current:.1f}%\n")
+            self.global_min_timestamp = timestamp
 
         if current > self.global_max:
             self.global_max = current
-            self.log_event(f"[NEW GLOBAL MAX] {timestamp}s → {current:.1f}%\n")
+            self.global_max_timestamp = timestamp
 
 
     def log_event(self, text: str):
@@ -178,6 +203,25 @@ class MainWindow(QWidget):
                 self.session_active = False
                 self.status_label.setText("EEG: OFFLINE")
                 self.status_label.setStyleSheet("color: red; font-size: 12px;")
+                end_timestamp = self.get_video_timestamp()
+
+                if self.low_period:
+                    start, cum, cnt = self.low_period
+                    avg = cum / cnt
+                    self.log_event(f"[LOW] {start:.2f}s - {end_timestamp:.2f}s -> {avg:.1f}%\n")
+                    self.low_period = None
+
+                if self.high_period:
+                    start, cum, cnt = self.high_period
+                    avg = cum / cnt
+                    self.log_event(f"[HIGH] {start:.2f}s - {end_timestamp:.2f}s -> {avg:.1f}%\n")
+                    self.high_period = None
+
+                # Глобальные MIN/MAX
+                if self.global_min_timestamp is not None:
+                    self.log_event(f"[LOWEST] {self.global_min_timestamp:.2f}s -> {self.global_min:.1f}%\n")
+                if self.global_max_timestamp is not None:
+                    self.log_event(f"[HIGHEST] {self.global_max_timestamp:.2f}s -> {self.global_max:.1f}%\n")
 
                 # финальный лог
                 if self.log_path:
