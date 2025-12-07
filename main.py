@@ -7,6 +7,7 @@ import glob
 import gc
 import threading
 import argparse
+import concurrent.futures  # Добавлено для соответствия семплу
 from datetime import datetime
 
 from PyQt5.QtWidgets import (
@@ -31,12 +32,21 @@ except ImportError:
     except ImportError:
         speedx = None
 
-# --- OPTIONAL LIBS ---
+# --- OPTIONAL LIBS (VLC) ---
 try:
     import vlc
 except ImportError:
     vlc = None
     pass
+
+# --- NEUROSDK IMPORTS (BrainBit) ---
+NEUROSDK_AVAILABLE = False
+try:
+    from neurosdk.scanner import Scanner
+    from neurosdk.cmn_types import *  # Импортируем все типы, как в примере
+    NEUROSDK_AVAILABLE = True
+except ImportError:
+    print("Warning: 'pyneurosdk2' not found. BrainBit features disabled.")
 
 # ==============================================================================
 # 0. UI STYLES
@@ -91,15 +101,23 @@ QPushButton#ActionBtn:hover { background-color: #65b8ff; }
 
 /* Exit Fullscreen Button */
 QPushButton#OverlayExitBtn {
-    background-color: rgba(0, 0, 0, 0.6);
-    border: 1px solid #555;
+    background-color: rgba(0, 0, 0, 0.8);
+    border: 1px solid #fff;
     border-radius: 4px;
     color: white;
     font-weight: bold;
+    font-size: 14px;
+    padding: 8px 16px;
+    min-width: 120px;
 }
 QPushButton#OverlayExitBtn:hover {
-    background-color: rgba(200, 0, 0, 0.8);
-    border-color: red;
+    background-color: rgba(255, 255, 255, 0.2);
+}
+
+/* BrainBit Status */
+QLabel#BrainBitStatus {
+    font-weight: bold;
+    padding: 0 10px;
 }
 
 QProgressBar {
@@ -280,6 +298,10 @@ def analyze_and_concatenate_video(csv_path, video_file, progress_callback=None):
     update_progress(100, "Processing Complete!")
     return results_data, output_root_folder
 
+# ==============================================================================
+# 2. WORKER THREADS
+# ==============================================================================
+
 class VideoAnalyzerWorker(QThread):
     finished = pyqtSignal(dict, str) 
     progress = pyqtSignal(int, str)  
@@ -300,8 +322,134 @@ class VideoAnalyzerWorker(QThread):
         except Exception as e: 
             self.error.emit(str(e))
 
+class BrainBitWorker(QThread):
+    """
+    Handles scanning and connecting to BrainBit in a background thread
+    following the logic from the pyneurosdk2 sample.
+    """
+    finished = pyqtSignal(object, str) # (sensor_object, message)
+    log = pyqtSignal(str)
+    battery_signal = pyqtSignal(int)
+    state_signal = pyqtSignal(str)
+
+    def __init__(self, target_serial=None):
+        super().__init__()
+        self.target_serial = target_serial
+        self.sensor_info_list = []
+
+    def on_sensor_found(self, scanner, sensors):
+        """Callback from scanner when a sensor is found."""
+        for index in range(len(sensors)):
+            msg = f"Sensor found: {sensors[index].Name} [{sensors[index].SerialNumber}]"
+            # print(msg) 
+            self.log.emit(msg)
+
+    # --- Callbacks for the sensor ---
+    def on_sensor_state_changed(self, sensor, state):
+        msg = f"Sensor {sensor.Name} state: {state}"
+        self.log.emit(msg)
+        self.state_signal.emit(str(state))
+
+    def on_battery_changed(self, sensor, battery):
+        msg = f"Battery: {battery}%"
+        self.log.emit(msg)
+        self.battery_signal.emit(battery)
+        
+    def on_signal_received(self, sensor, data):
+        # Data is coming in rapidly, typically we don't log every packet to GUI 
+        # to avoid freezing, but we can process it here.
+        pass
+
+    def run(self):
+        if not NEUROSDK_AVAILABLE:
+            self.finished.emit(None, "SDK not installed")
+            return
+
+        try:
+            # 1. Setup Scanner
+            scanner = Scanner([SensorFamily.LEBrainBit, SensorFamily.LEBrainBitBlack])
+            scanner.sensorsChanged = self.on_sensor_found
+            
+            # 2. Start Search
+            self.log.emit("Starting search for 5 sec...")
+            scanner.start()
+            time.sleep(5)
+            scanner.stop()
+
+            # 3. Get results
+            sensors_info = scanner.sensors()
+            if not sensors_info:
+                self.log.emit("No sensors found.")
+                self.finished.emit(None, "No devices found")
+                del scanner
+                return
+
+            # 4. Determine target sensor
+            target_sensor_info = None
+            if self.target_serial:
+                self.log.emit(f"Looking for serial: {self.target_serial}")
+                for s in sensors_info:
+                    if s.SerialNumber == self.target_serial:
+                        target_sensor_info = s
+                        break
+                if not target_sensor_info:
+                    self.finished.emit(None, f"Device {self.target_serial} not found in scan results.")
+                    del scanner
+                    return
+            else:
+                target_sensor_info = sensors_info[0] # Take the first one found
+
+            self.log.emit(f"Connecting to {target_sensor_info.Name} ({target_sensor_info.SerialNumber})...")
+
+            # 5. Connect using ThreadPoolExecutor (as per sample)
+            def device_connection(s_info):
+                return scanner.create_sensor(s_info)
+
+            sensor = None
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(device_connection, target_sensor_info)
+                sensor = future.result()
+                self.log.emit("Device connected (created).")
+
+            # 6. Configure Sensor Callbacks
+            sensor.sensorStateChanged = self.on_sensor_state_changed
+            sensor.batteryChanged = self.on_battery_changed
+            
+            # Check features like the sample does
+            if sensor.is_supported_feature(SensorFeature.Signal):
+                sensor.signalDataReceived = self.on_signal_received
+            
+            # Print details (logging to GUI)
+            self.log.emit(f"Family: {sensor.sens_family}")
+            self.log.emit(f"Name: {sensor.name}")
+            self.log.emit(f"State: {sensor.state}")
+            self.log.emit(f"Serial: {sensor.serial_number}")
+            self.log.emit(f"Battery: {sensor.batt_power}%")
+
+            # Check connection state
+            if sensor.state == SensorState.StateInRange:
+                self.log.emit("Connection verified: StateInRange")
+                
+                # Start Signal command if supported (example usage from sample)
+                if sensor.is_supported_command(SensorCommand.StartSignal):
+                     # Not starting signal automatically to save battery/bandwidth, 
+                     # but connection is ready.
+                     self.log.emit("Signal command supported.")
+                
+                self.finished.emit(sensor, "Connected")
+            else:
+                self.finished.emit(sensor, "Created but not InRange")
+
+            # 7. Cleanup Scanner (Sensor stays alive)
+            del scanner
+            self.log.emit("Scanner removed.")
+
+        except Exception as e:
+            self.log.emit(f"Error: {e}")
+            self.finished.emit(None, str(e))
+
 # ==============================================================================
-# 2. GUI WIDGETS
+# 3. GUI WIDGETS
 # ==============================================================================
 
 class VideoClickableFrame(QFrame):
@@ -310,33 +458,75 @@ class VideoClickableFrame(QFrame):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.exit_btn = QPushButton("✕ Exit Fullscreen", self)
+        self.exit_btn = QPushButton("✕ Exit Fullscreen (Esc)", self)
         self.exit_btn.setObjectName("OverlayExitBtn")
-        self.exit_btn.setFixedSize(120, 40)
+        self.exit_btn.setFixedSize(150, 40)
         self.exit_btn.hide()
         self.exit_btn.clicked.connect(self.exitFullscreen.emit)
         
+        # Add a semi-transparent overlay for controls
+        self.controls_overlay = QWidget(self)
+        self.controls_overlay.setStyleSheet("background-color: rgba(0, 0, 0, 0.5);")
+        self.controls_overlay.hide()
+        
+        # Add a play button in the center
+        self.play_btn = QPushButton(self)
+        self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.play_btn.setIconSize(QSize(64, 64))
+        self.play_btn.setFixedSize(80, 80)
+        self.play_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(0, 0, 0, 0.7);
+                border: 2px solid white;
+                border-radius: 40px;
+            }
+            QPushButton:hover {
+                background-color: rgba(0, 0, 0, 0.9);
+            }
+        """)
+        self.play_btn.hide()
+        
         self.setMouseTracking(True)
         self._is_fs = False
+        self._controls_visible = False
 
     def mouseDoubleClickEvent(self, event):
-        self.doubleClicked.emit()
-
+        if event.button() == Qt.LeftButton:
+            self.doubleClicked.emit()
+    
     def mouseMoveEvent(self, event):
         if self._is_fs:
-            w = self.width()
-            if event.x() > w - 200 and event.y() < 100:
-                self.exit_btn.move(w - 140, 20)
-                self.exit_btn.show()
-                self.exit_btn.raise_()
-            else:
-                self.exit_btn.hide()
-        super().mouseMoveEvent(event)
-
+            pos = event.pos()
+            at_bottom = pos.y() > self.height() - 100
+            at_center = (self.width()/2 - 100 < pos.x() < self.width()/2 + 100 and 
+                        self.height()/2 - 100 < pos.y() < self.height()/2 + 100)
+            
+            # Position exit button at top right
+            self.exit_btn.move(self.width() - self.exit_btn.width() - 20, 20)
+            self.exit_btn.setVisible(True)  # Always show exit button in fullscreen
+            
+            # Position play button at center
+            self.play_btn.move(self.width()//2 - 40, self.height()//2 - 40)
+            self.play_btn.setVisible(at_center)
+            
+            # Show/hide controls overlay
+            self.controls_overlay.setVisible(at_bottom)
+            if at_bottom:
+                self.controls_overlay.setGeometry(0, self.height() - 60, self.width(), 60)
+    
     def set_fullscreen_mode(self, enabled):
         self._is_fs = enabled
-        if not enabled:
+        if enabled:
+            self.controls_overlay.show()
+            self.exit_btn.show()
+            self.play_btn.show()
+            self.setCursor(Qt.ArrowCursor)
+            QTimer.singleShot(3000, lambda: self.setCursor(Qt.BlankCursor) if not self.underMouse() else None)
+        else:
+            self.controls_overlay.hide()
             self.exit_btn.hide()
+            self.play_btn.hide()
+            self.unsetCursor()
 
 class VideoCardWidget(QFrame):
     playClicked = pyqtSignal(str) 
@@ -375,6 +565,10 @@ class VideoAnalyzerApp(QMainWindow):
         self.results_data = {} 
         self.current_video_path = None
         
+        # BrainBit Data
+        self.brainbit_sensor = None
+        self.brainbit_worker = None
+        
         self.timer = QTimer(self)
         self.timer.setInterval(100)
         self.timer.timeout.connect(self.update_ui_timer)
@@ -403,7 +597,32 @@ class VideoAnalyzerApp(QMainWindow):
     def build_analyzer_ui(self, parent_widget):
         main_layout = QVBoxLayout(parent_widget)
         main_layout.setSpacing(15)
-        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setContentsMargins(20, 10, 20, 20) # Top margin smaller to fit header
+
+        # 0. HEADER (BrainBit Connection)
+        header_layout = QHBoxLayout()
+        header_layout.addStretch() # Push everything to the right
+        
+        lbl_sn = QLabel("BrainBit SN:")
+        lbl_sn.setStyleSheet("color: #888;")
+        header_layout.addWidget(lbl_sn)
+        
+        self.bb_serial_input = QLineEdit()
+        self.bb_serial_input.setPlaceholderText("Serial (Opt)")
+        self.bb_serial_input.setFixedWidth(120)
+        header_layout.addWidget(self.bb_serial_input)
+        
+        self.btn_connect_bb = QPushButton("Connect")
+        self.btn_connect_bb.setFixedWidth(80)
+        self.btn_connect_bb.clicked.connect(self.toggle_brainbit_connection)
+        header_layout.addWidget(self.btn_connect_bb)
+        
+        self.lbl_bb_status = QLabel("●")
+        self.lbl_bb_status.setObjectName("BrainBitStatus")
+        self.lbl_bb_status.setStyleSheet("color: #444; font-size: 18px;")
+        header_layout.addWidget(self.lbl_bb_status)
+        
+        main_layout.addLayout(header_layout)
 
         # 1. Project Configuration
         self.file_group = QGroupBox("Analysis Source Files")
@@ -507,6 +726,55 @@ class VideoAnalyzerApp(QMainWindow):
         main_layout.addWidget(self.inner_tabs)
         self.check_enable_button()
 
+    # --- BRAINBIT METHODS ---
+    def toggle_brainbit_connection(self):
+        if self.brainbit_sensor is not None:
+            # Disconnect
+            try:
+                self.brainbit_sensor.disconnect()
+                # Clean delete of sensor object
+                del self.brainbit_sensor
+            except Exception as e:
+                print(f"Disconnect error: {e}")
+                
+            self.brainbit_sensor = None
+            self.lbl_bb_status.setStyleSheet("color: #444;") # Gray
+            self.btn_connect_bb.setText("Connect")
+            self.bb_serial_input.setEnabled(True)
+            self.lbl_progress_status.setText("Disconnected from BrainBit.")
+        else:
+            # Connect
+            serial = self.bb_serial_input.text().strip()
+            
+            self.btn_connect_bb.setEnabled(False)
+            self.btn_connect_bb.setText("Scanning...")
+            self.lbl_bb_status.setStyleSheet("color: #FFD700;") # Yellow
+            self.bb_serial_input.setEnabled(False)
+            
+            self.brainbit_worker = BrainBitWorker(serial if serial else None)
+            self.brainbit_worker.log.connect(lambda s: self.lbl_progress_status.setText(s))
+            self.brainbit_worker.finished.connect(self.on_brainbit_connected)
+            # You can also hook up battery/state signals to UI labels here
+            # self.brainbit_worker.battery_signal.connect(...)
+            self.brainbit_worker.start()
+
+    def on_brainbit_connected(self, sensor, msg):
+        self.btn_connect_bb.setEnabled(True)
+        if sensor:
+            self.brainbit_sensor = sensor
+            self.lbl_bb_status.setStyleSheet("color: #00FF00;") # Green
+            self.btn_connect_bb.setText("Disconnect")
+            self.lbl_progress_status.setText(f"Connected: {sensor.serial_number}")
+            QMessageBox.information(self, "BrainBit", f"Successfully connected to {sensor.name}!")
+        else:
+            self.brainbit_sensor = None
+            self.lbl_bb_status.setStyleSheet("color: #FF0000;") # Red
+            self.btn_connect_bb.setText("Connect")
+            self.bb_serial_input.setEnabled(True)
+            self.lbl_progress_status.setText(msg)
+            QMessageBox.warning(self, "Connection Failed", msg)
+
+    # --- UI HELPERS ---
     def create_list_tab(self):
         w = QWidget(); l = QVBoxLayout(w); l.setContentsMargins(10,10,10,10)
         t = QTableWidget(); t.setColumnCount(4)
@@ -781,24 +1049,44 @@ class VideoAnalyzerApp(QMainWindow):
         try:
             if self.media_player.get_state() == vlc.State.Ended:
                 self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-                self.position_slider.setValue(0); return
+                if hasattr(self, 'video_frame') and hasattr(self.video_frame, 'play_btn'):
+                    self.video_frame.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+                self.position_slider.setValue(0)
+                return
+                
             if self.media_player.is_playing() or self.media_player.get_state() == vlc.State.Paused:
+                # Update position slider
+                position = int(self.media_player.get_position() * 1000)
                 self.position_slider.blockSignals(True)
-                self.position_slider.setValue(int(self.media_player.get_position() * 1000))
+                self.position_slider.setValue(position)
                 self.position_slider.blockSignals(False)
-                c, t = self.media_player.get_time(), self.media_player.get_length()
+                
+                # Update time label
+                current_time = self.media_player.get_time()
+                total_time = self.media_player.get_length()
                 fmt = lambda x: f"{int(x/1000)//60:02}:{int(x/1000)%60:02}"
-                self.time_label.setText(f"{fmt(c)} / {fmt(t)}")
-        except: pass
+                self.time_label.setText(f"{fmt(current_time)} / {fmt(total_time)}")
+                
+                # Update play/pause button state
+                is_playing = self.media_player.is_playing()
+                self.play_button.setIcon(
+                    self.style().standardIcon(
+                        QStyle.SP_MediaPause if is_playing else QStyle.SP_MediaPlay
+                    )
+                )
+                if hasattr(self, 'video_frame') and hasattr(self.video_frame, 'play_btn'):
+                    self.video_frame.play_btn.setIcon(
+                        self.style().standardIcon(
+                            QStyle.SP_MediaPause if is_playing else QStyle.SP_MediaPlay
+                        )
+                    )
+        except Exception as e:
+            print(f"Error in update_ui_timer: {e}")
 
     def tab_changed(self, idx):
         cat = 'Focus_Highlights' if idx in [0,1] else 'Relaxation_Moments'
         data = self.results_data.get(cat)
         if data and os.path.exists(data['path']): self.load_video(data['path'], False)
-        else: 
-            self.timer.stop(); 
-            if self.media_player: self.media_player.stop()
-            self.current_video_path = None
     
     def on_segment_clicked(self, r, c):
         sender = self.sender()
@@ -815,14 +1103,25 @@ class VideoAnalyzerApp(QMainWindow):
         if self.isFullScreen():
             self.exit_fullscreen()
         else:
-            self.file_group.hide(); self.inner_tabs.hide(); self.controls_widget.hide()
+            self.file_group.hide()
+            self.inner_tabs.hide()
+            self.controls_widget.hide()
             self.showFullScreen()
             self.video_frame.set_fullscreen_mode(True)
+            # Connect play button in fullscreen mode
+            self.video_frame.play_btn.clicked.connect(self.play_video)
 
     def exit_fullscreen(self):
         self.showNormal()
-        self.file_group.show(); self.inner_tabs.show(); self.controls_widget.show()
+        self.file_group.show()
+        self.inner_tabs.show()
+        self.controls_widget.show()
         self.video_frame.set_fullscreen_mode(False)
+        # Disconnect play button when exiting fullscreen to avoid multiple connections
+        try:
+            self.video_frame.play_btn.clicked.disconnect()
+        except:
+            pass
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape and self.isFullScreen():
@@ -833,6 +1132,14 @@ class VideoAnalyzerApp(QMainWindow):
     def closeEvent(self, event):
         self.timer.stop()
         if self.media_player: self.media_player.stop(); self.media_player.release()
+        
+        # Disconnect BrainBit
+        if self.brainbit_sensor:
+            try:
+                self.brainbit_sensor.disconnect()
+                del self.brainbit_sensor
+            except: pass
+            
         super().closeEvent(event)
 
 if __name__ == "__main__":
