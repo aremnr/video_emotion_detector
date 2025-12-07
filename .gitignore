@@ -2,3 +2,5 @@
 .env
 logs/
 __pycache__/
+libmpv-2.dll
+session_logs/
