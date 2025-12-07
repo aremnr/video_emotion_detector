@@ -354,10 +354,9 @@ class RecordingWorker(QThread):
                     self.write_averaged_log(csv_path)
                     self.next_log_timestamp += self.log_interval_ms
                 
-                progress_pct = int((elapsed_sec % 60) / 60 * 100)
                 status = f"Recording... {int(elapsed_sec)}s"
                 if calib_val < 100: status += f" [Calib: {calib_val:.0f}%]"
-                self.progress.emit(progress_pct, status, focus_val, relax_val)
+                self.progress.emit(100, status, focus_val, relax_val)
                 time.sleep(1.0 / self.fps)
                 
         except Exception as e: self.error.emit(str(e))
@@ -918,13 +917,26 @@ class VideoAnalyzerApp(QMainWindow):
         t = self.csv_path_input if mode == 'csv' else self.video_path_input
         p, _ = QFileDialog.getOpenFileName(self, "Select", "", f)
         if p: t.setText(p); self.check_enable_button()
-    def check_enable_button(self):
-        c, v = os.path.exists(self.csv_path_input.text()), os.path.exists(self.video_path_input.text())
-        self.analyze_button.setEnabled(c and v)
-        if c and v: 
-            if self.load_existing_results(None, self.csv_path_input.text()):
-                self.populate_data(); self.analyze_button.setText("RE-PROCESS")
-            else: self.analyze_button.setText("START PROCESSING")
+    def check_enable_button(self,loaded_proj = False):
+        csv_ok = os.path.exists(self.csv_path_input.text())
+        video_ok = os.path.exists(self.video_path_input.text())
+
+        # Пытаемся загрузить проект по одному CSV
+        project_loaded = False
+        if csv_ok:
+            project_loaded = self.load_existing_results(None, self.csv_path_input.text())
+
+        # Доступно два режима:
+        # 1) CSV + VIDEO → можно заново анализировать
+        # 2) CSV + найден проект → можно открыть без видео
+        if (csv_ok and video_ok) or project_loaded:
+            self.analyze_button.setEnabled(csv_ok and video_ok)
+            self.analyze_button.setText("RE-PROCESS" if video_ok else "ANALYSIS DISABLED (no video)")
+            if project_loaded:
+                self.populate_data()
+        else:
+            self.analyze_button.setEnabled(False)
+            self.analyze_button.setText("START PROCESSING")
     def start_analysis(self):
         self.reset_state(); self.analyze_button.setEnabled(False)
         self.progress_bar.setVisible(True); self.progress_bar.setValue(0)
@@ -954,6 +966,9 @@ class VideoAnalyzerApp(QMainWindow):
     def load_existing_results(self, v_path, c_path):
         """Полная логика загрузки существующего проекта"""
         out_dir = os.path.dirname(os.path.abspath(c_path))
+
+        # Если исходного видео нет — это НЕ ошибка
+        video_available = os.path.exists(v_path) if v_path else False
         try:
             # Пытаемся восстановить метаданные сегментов из исходного CSV
             df = pd.read_csv(c_path)
@@ -1089,25 +1104,11 @@ class VideoAnalyzerApp(QMainWindow):
     def closeEvent(self, e):
         if self.connector: self.connector.stop_signal_from_ui()
         super().closeEvent(e)
-    # --- HELPER FOR LOADING ---
-    def load_existing_results(self, v, c):
-        try:
-            df = pd.read_csv(c); start_ms = df['Timestamp_ms'].iloc[0]
-            res = {}
-            for cat in CATEGORY_CONFIG:
-                mdir = os.path.dirname(c)
-                mpath = os.path.join(mdir, "focus montage.mp4" if "Focus" in cat else "relaxation montage.mp4")
-                if os.path.exists(mpath):
-                    res[cat] = {'path': mpath, 'segments': [], 'total_duration': 0}
-                    # Simple loading logic (assumes files exist), specific logic omitted for brevity
-            if res: self.results_data = res; return True
-        except: pass
-        return False
     def open_project_folder(self):
         d = QFileDialog.getExistingDirectory(self, "Project Folder")
         if d:
             csvs = glob.glob(os.path.join(d, "*.csv"))
-            if csvs: self.csv_path_input.setText(csvs[0]); self.check_enable_button()
+            if csvs: self.csv_path_input.setText(csvs[0]); self.check_enable_button(True)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
