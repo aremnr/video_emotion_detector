@@ -1,6 +1,0 @@
-=== EEG SESSION STARTED ===
-Created: 2025-12-06_19-59-01
-
-[LOWEST] 0.00s -> 19.6%
-[HIGHEST] 0.00s -> 20.8%
-=== SESSION ENDED ===

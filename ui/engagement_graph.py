@@ -5,32 +5,28 @@ import time
 
 
 class EngagementGraph(QWidget):
+
     def __init__(self, parent=None):
         super().__init__(parent)
-
-        # --- Layout ---
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0,0,0,0)
+        layout.setContentsMargins(0, 0, 0, 0)
 
         self.plot_widget = pg.PlotWidget()
         layout.addWidget(self.plot_widget)
 
-        self.plot_widget.disableAutoRange()
-        self.last_update = 0
-
         # --- Настройки графика ---
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
-        self.plot_widget.setYRange(0, 100)
-        self.plot_widget.setXRange(0, 200)
+        self.plot_widget.setMouseEnabled(x=True, y=True)  # разрешаем zoom/scroll мышью
+        self.plot_widget.setMenuEnabled(True)
+        self.plot_widget.setLabel('left', 'Engagement (%)')
+        self.plot_widget.setLabel('bottom', 'Time (frames)')
 
-        # Линия графика
         self.plot = self.plot_widget.plot(
             [],
             pen=pg.mkPen(color=(0, 200, 255), width=2),
             antialias=True
         )
 
-        # Подпись текущего значения
         self.engagement_label = QLabel("Current engagement: 0%")
         self.engagement_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.engagement_label.setStyleSheet(
@@ -38,48 +34,44 @@ class EngagementGraph(QWidget):
         )
         layout.addWidget(self.engagement_label)
 
-        # Данные
         self.data = []
         self.max_points = 10000
-
-        # Параметр сглаживания
         self.alpha = 0.2
 
-    # ----------------------------------------
-    # Метод для получения реальных значений
-    # вызывается из MainWindow.on_engagement_update()
-    # ----------------------------------------
+        # Таймер для плавного обновления графика
+        self._timer = pg.QtCore.QTimer()
+        self._timer.setInterval(50)  # 20 FPS
+        self._timer.timeout.connect(self._update_plot)
+        self._pending_update = False
+        self._timer.start()
+
+        self._last_smooth = 50
+
     def add_external_value(self, value):
         raw = value * 100
-
-        # сглаживание
         last = self.data[-1] if self.data else 50
         smooth = self.alpha * raw + (1 - self.alpha) * last
-
-        # обновление массива
+        self._last_smooth = smooth
         self.data.append(smooth)
         if len(self.data) > self.max_points:
             self.data.pop(0)
+        self._pending_update = True
 
-        # --- стабильное обновление графика (не чаще 60 FPS) ---
-        now = time.time()
-        if now - self.last_update < 1/60:
+    def _update_plot(self):
+        if not self._pending_update:
             return
-        self.last_update = now
-
+        self._pending_update = False
         self.plot.setData(self.data, clear=False)
-
-        # --- стабильно работающая автопрокрутка ---
-        n = len(self.data)
-        visible_width = 200
-
-        if n > visible_width:
-            self.plot_widget.setXRange(n - visible_width, n, padding=0)
-        else:
-            self.plot_widget.setXRange(0, visible_width, padding=0)
-
-        # подпись
-        self.engagement_label.setText(f"Current engagement: {int(smooth)}%")
+        # Автоматическое масштабирование по Y
+        if self.data:
+            min_y = min(self.data)
+            max_y = max(self.data)
+            if min_y == max_y:
+                min_y -= 1
+                max_y += 1
+            self.plot_widget.setYRange(min_y - 5, max_y + 5, padding=0)
+            self.plot_widget.setXRange(max(0, len(self.data) - 200), len(self.data), padding=0)
+        self.engagement_label.setText(f"Current engagement: {int(self._last_smooth)}%")
 
     def get_latest_value(self):
         if not self.data:
@@ -89,3 +81,4 @@ class EngagementGraph(QWidget):
 
     def get_data(self):
         return self.data
+
