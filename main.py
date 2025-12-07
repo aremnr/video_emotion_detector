@@ -7,17 +7,24 @@ import glob
 import gc
 import threading
 import argparse
-import concurrent.futures  # Добавлено для соответствия семплу
+import concurrent.futures
+import subprocess
 from datetime import datetime
+import cv2
+import numpy as np
+from PIL import ImageGrab
+import mss
+import mss.tools
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QPushButton, QLineEdit, QLabel, QFileDialog, QTabWidget, 
     QMessageBox, QGroupBox, QSlider, QStyle, QFrame, QSizePolicy, 
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QScrollArea, QSplitter, QSpacerItem, QTextEdit, QProgressBar
+    QScrollArea, QSplitter, QSpacerItem, QTextEdit, QProgressBar,
+    QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox
 )
-from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QSize, QRect
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QSize, QRect, QThreadPool, QRunnable
 from PyQt5.QtGui import QIcon, QFont, QPalette, QColor, QCursor, QImage, QPixmap, QPainter
 
 # --- MOVIEPY IMPORTS ---
@@ -43,10 +50,20 @@ except ImportError:
 NEUROSDK_AVAILABLE = False
 try:
     from neurosdk.scanner import Scanner
-    from neurosdk.cmn_types import *  # Импортируем все типы, как в примере
+    from neurosdk.cmn_types import *
     NEUROSDK_AVAILABLE = True
 except ImportError:
     print("Warning: 'pyneurosdk2' not found. BrainBit features disabled.")
+
+# --- EMOTION LIBRARY (BrainBit Algorithms) ---
+EMOTION_LIB_AVAILABLE = False
+try:
+    from em_st_artifacts.emotional_math import EmotionalMath
+    from em_st_artifacts import lib_settings
+    from em_st_artifacts import support_classes
+    EMOTION_LIB_AVAILABLE = True
+except ImportError:
+    print("Warning: 'pyem-st-artifacts' not found. Emotional analysis disabled.")
 
 # ==============================================================================
 # 0. UI STYLES
@@ -152,6 +169,25 @@ QPushButton#CardPlayBtn:hover { background-color: rgba(255, 255, 255, 0.1); bord
 QTableWidget { background-color: #121212; gridline-color: #333; border: none; font-size: 13px; }
 QHeaderView::section { background-color: #202020; color: #aaa; padding: 6px; border: none; border-bottom: 1px solid #333; }
 QTableWidget::item:selected { background-color: #333; color: #3ea6ff; }
+
+/* Recorder specific */
+QPushButton#RecordBtn {
+    background-color: #ff3b30;
+    color: white;
+    font-weight: bold;
+    padding: 12px;
+}
+QPushButton#RecordBtn:hover { background-color: #ff5e54; }
+QPushButton#RecordBtn:disabled { background-color: #5a2c2c; color: #777; }
+
+QPushButton#StopBtn {
+    background-color: #3ea6ff;
+    color: white;
+    font-weight: bold;
+    padding: 12px;
+}
+QPushButton#StopBtn:hover { background-color: #65b8ff; }
+QPushButton#StopBtn:disabled { background-color: #2a4a66; color: #777; }
 """
 
 # ==============================================================================
@@ -299,7 +335,120 @@ def analyze_and_concatenate_video(csv_path, video_file, progress_callback=None):
     return results_data, output_root_folder
 
 # ==============================================================================
-# 2. WORKER THREADS
+# 2. RECORDING LOGIC
+# ==============================================================================
+
+class ScreenRecorder:
+    def __init__(self, output_path, fps=30, monitor=1):
+        self.output_path = output_path
+        self.fps = fps
+        self.monitor = monitor
+        self.is_recording = False
+        self.video_writer = None
+        self.frame_count = 0
+        self.start_time = None
+        
+    def start(self):
+        self.is_recording = True
+        self.frame_count = 0
+        self.start_time = time.time()
+        
+        # Get screen size using mss
+        with mss.mss() as sct:
+            monitor_info = sct.monitors[self.monitor]
+            width = monitor_info['width']
+            height = monitor_info['height']
+        
+        # Initialize video writer
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        self.video_writer = cv2.VideoWriter(
+            self.output_path, 
+            fourcc, 
+            self.fps, 
+            (width, height)
+        )
+        
+    def capture_frame(self):
+        if not self.is_recording or not self.video_writer:
+            return
+            
+        with mss.mss() as sct:
+            screenshot = sct.grab(sct.monitors[self.monitor])
+            
+            # Convert to numpy array
+            img = np.array(screenshot)
+            # Convert BGRA to BGR
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            
+            self.video_writer.write(img)
+            self.frame_count += 1
+    
+    def stop(self):
+        self.is_recording = False
+        if self.video_writer:
+            self.video_writer.release()
+            self.video_writer = None
+            
+    def get_recording_time(self):
+        if self.start_time:
+            return time.time() - self.start_time
+        return 0
+
+class BrainBitDataCollector:
+    def __init__(self, sensor, emotion_lib=None):
+        self.sensor = sensor
+        self.emotion_lib = emotion_lib
+        self.is_collecting = False
+        self.data = []
+        self.start_time = None
+        self.sample_count = 0
+        
+    def start(self):
+        self.is_collecting = True
+        self.data = []
+        self.start_time = time.time() * 1000  # Convert to milliseconds
+        self.sample_count = 0
+        
+        # Start signal if sensor supports it
+        if self.sensor and hasattr(self.sensor, 'exec_command'):
+            try:
+                self.sensor.exec_command(SensorCommand.CommandStartSignal)
+            except:
+                pass
+        
+    def collect_sample(self, relaxation=0, focus=0, artifact=0):
+        if not self.is_collecting:
+            return
+            
+        timestamp = int(time.time() * 1000 - self.start_time)
+        self.data.append({
+            'Timestamp_ms': timestamp,
+            'Relaxation': relaxation,
+            'Focus': focus,
+            'Artifact': artifact
+        })
+        self.sample_count += 1
+        
+    def stop(self):
+        self.is_collecting = False
+        
+        # Stop signal if sensor supports it
+        if self.sensor and hasattr(self.sensor, 'exec_command'):
+            try:
+                self.sensor.exec_command(SensorCommand.CommandStopSignal)
+            except:
+                pass
+        
+    def save_to_csv(self, filepath):
+        if not self.data:
+            return False
+            
+        df = pd.DataFrame(self.data)
+        df.to_csv(filepath, index=False)
+        return True
+
+# ==============================================================================
+# 3. WORKER THREADS
 # ==============================================================================
 
 class VideoAnalyzerWorker(QThread):
@@ -323,28 +472,23 @@ class VideoAnalyzerWorker(QThread):
             self.error.emit(str(e))
 
 class BrainBitWorker(QThread):
-    """
-    Handles scanning and connecting to BrainBit in a background thread
-    following the logic from the pyneurosdk2 sample.
-    """
     finished = pyqtSignal(object, str) # (sensor_object, message)
     log = pyqtSignal(str)
     battery_signal = pyqtSignal(int)
     state_signal = pyqtSignal(str)
+    signal_data = pyqtSignal(list)  # New signal for raw signal data
 
     def __init__(self, target_serial=None):
         super().__init__()
         self.target_serial = target_serial
         self.sensor_info_list = []
+        self.collect_signal = False
 
     def on_sensor_found(self, scanner, sensors):
-        """Callback from scanner when a sensor is found."""
         for index in range(len(sensors)):
             msg = f"Sensor found: {sensors[index].Name} [{sensors[index].SerialNumber}]"
-            # print(msg) 
             self.log.emit(msg)
 
-    # --- Callbacks for the sensor ---
     def on_sensor_state_changed(self, sensor, state):
         msg = f"Sensor {sensor.Name} state: {state}"
         self.log.emit(msg)
@@ -356,9 +500,9 @@ class BrainBitWorker(QThread):
         self.battery_signal.emit(battery)
         
     def on_signal_received(self, sensor, data):
-        # Data is coming in rapidly, typically we don't log every packet to GUI 
-        # to avoid freezing, but we can process it here.
-        pass
+        # Emit signal data for processing
+        if self.collect_signal:
+            self.signal_data.emit(data)
 
     def run(self):
         if not NEUROSDK_AVAILABLE:
@@ -397,11 +541,11 @@ class BrainBitWorker(QThread):
                     del scanner
                     return
             else:
-                target_sensor_info = sensors_info[0] # Take the first one found
+                target_sensor_info = sensors_info[0]
 
             self.log.emit(f"Connecting to {target_sensor_info.Name} ({target_sensor_info.SerialNumber})...")
 
-            # 5. Connect using ThreadPoolExecutor (as per sample)
+            # 5. Connect using ThreadPoolExecutor
             def device_connection(s_info):
                 return scanner.create_sensor(s_info)
 
@@ -415,11 +559,11 @@ class BrainBitWorker(QThread):
             sensor.sensorStateChanged = self.on_sensor_state_changed
             sensor.batteryChanged = self.on_battery_changed
             
-            # Check features like the sample does
+            # Setup signal callback
             if sensor.is_supported_feature(SensorFeature.Signal):
                 sensor.signalDataReceived = self.on_signal_received
             
-            # Print details (logging to GUI)
+            # Print details
             self.log.emit(f"Family: {sensor.sens_family}")
             self.log.emit(f"Name: {sensor.name}")
             self.log.emit(f"State: {sensor.state}")
@@ -429,18 +573,11 @@ class BrainBitWorker(QThread):
             # Check connection state
             if sensor.state == SensorState.StateInRange:
                 self.log.emit("Connection verified: StateInRange")
-                
-                # Start Signal command if supported (example usage from sample)
-                if sensor.is_supported_command(SensorCommand.StartSignal):
-                     # Not starting signal automatically to save battery/bandwidth, 
-                     # but connection is ready.
-                     self.log.emit("Signal command supported.")
-                
                 self.finished.emit(sensor, "Connected")
             else:
                 self.finished.emit(sensor, "Created but not InRange")
 
-            # 7. Cleanup Scanner (Sensor stays alive)
+            # 7. Cleanup Scanner
             del scanner
             self.log.emit("Scanner removed.")
 
@@ -448,8 +585,216 @@ class BrainBitWorker(QThread):
             self.log.emit(f"Error: {e}")
             self.finished.emit(None, str(e))
 
+class RecordingWorker(QThread):
+    progress = pyqtSignal(int, str, float, float)  # progress, status, focus, relaxation
+    finished = pyqtSignal(str, str)  # video_path, csv_path
+    error = pyqtSignal(str)
+    
+    def __init__(self, output_dir, fps=30, monitor=1, sensor=None):
+        super().__init__()
+        self.output_dir = output_dir
+        self.fps = fps
+        self.monitor = monitor
+        self.sensor = sensor
+        self.is_recording = False
+        self.recorder = None
+        self.data_collector = None
+        self.emotion_lib = None
+        
+    def init_emotion_lib(self):
+        """Initialize emotion analysis library if available"""
+        if not EMOTION_LIB_AVAILABLE:
+            return None
+            
+        try:
+            # Default settings for BrainBit
+            mls = lib_settings.MathLibSetting(
+                sampling_rate=250,
+                process_win_freq=25,
+                n_first_sec_skipped=4,
+                fft_window=1000,
+                bipolar_mode=True,
+                squared_spectrum=True,
+                channels_number=4,
+                channel_for_analysis=0
+            )
+            
+            ads = lib_settings.ArtifactDetectSetting(
+                art_bord=110,
+                allowed_percent_artpoints=70,
+                raw_betap_limit=800_000,
+                global_artwin_sec=4,
+                num_wins_for_quality_avg=125,
+                hamming_win_spectrum=True,
+                hanning_win_spectrum=False,
+                total_pow_border=400_000_000,
+                spect_art_by_totalp=True
+            )
+            
+            sads = lib_settings.ShortArtifactDetectSetting(
+                ampl_art_detect_win_size=200,
+                ampl_art_zerod_area=200,
+                ampl_art_extremum_border=25
+            )
+            
+            mss = lib_settings.MentalAndSpectralSetting(
+                n_sec_for_averaging=2,
+                n_sec_for_instant_estimation=4
+            )
+            
+            math = EmotionalMath(mls, ads, sads, mss)
+            math.set_calibration_length(6)  # 6 seconds calibration
+            math.set_mental_estimation_mode(False)
+            math.set_skip_wins_after_artifact(10)
+            math.set_zero_spect_waves(True, 0, 1, 1, 1, 0)
+            math.set_spect_normalization_by_bands_width(True)
+            
+            return math
+            
+        except Exception as e:
+            print(f"Failed to init emotion lib: {e}")
+            return None
+    
+    def on_signal_data(self, data):
+        """Process incoming signal data from BrainBit"""
+        if not self.is_recording or not self.emotion_lib:
+            return
+            
+        try:
+            raw_channels = []
+            for sample in data:
+                # Calculate bipolar channels (T3-O1 and T4-O2)
+                left_bipolar = sample.T3 - sample.O1
+                right_bipolar = sample.T4 - sample.O2
+                raw_channels.append(support_classes.RawChannels(left_bipolar, right_bipolar))
+            
+            # Push data to emotion library
+            self.emotion_lib.push_data(raw_channels)
+            self.emotion_lib.process_data_arr()
+            
+            # Read mental data if calibration is finished
+            if self.emotion_lib.calibration_finished():
+                mental_data = self.emotion_lib.read_mental_data_arr()
+                if mental_data:
+                    latest = mental_data[-1]
+                    # Emit focus and relaxation values
+                    self.progress.emit(-1, "", latest.Inst_Attention, latest.Inst_Relaxation)
+            
+        except Exception as e:
+            print(f"Error processing signal: {e}")
+    
+    def run(self):
+        try:
+            self.is_recording = True
+            
+            # Create output directory
+            os.makedirs(self.output_dir, exist_ok=True)
+            
+            # Generate filenames with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            video_path = os.path.join(self.output_dir, f"recording_{timestamp}.mp4")
+            csv_path = os.path.join(self.output_dir, f"data_{timestamp}.csv")
+            
+            # Initialize screen recorder
+            self.recorder = ScreenRecorder(video_path, self.fps, self.monitor)
+            
+            # Initialize data collector
+            self.data_collector = BrainBitDataCollector(self.sensor)
+            
+            # Initialize emotion library if sensor is available
+            if self.sensor:
+                self.emotion_lib = self.init_emotion_lib()
+                if self.emotion_lib:
+                    # Start calibration
+                    self.emotion_lib.start_calibration()
+            
+            # Start recording
+            self.recorder.start()
+            self.data_collector.start()
+            
+            # Start signal collection if sensor is available
+            if self.sensor and hasattr(self.sensor, 'exec_command'):
+                try:
+                    self.sensor.exec_command(SensorCommand.CommandStartSignal)
+                except:
+                    pass
+            
+            start_time = time.time()
+            calibration_done = False
+            
+            # Main recording loop
+            while self.is_recording:
+                elapsed = time.time() - start_time
+                
+                # Capture screen frame
+                self.recorder.capture_frame()
+                
+                # Update progress
+                progress = int((elapsed % 60) / 60 * 100)  # Progress within each minute
+                status = f"Recording... {int(elapsed)}s"
+                
+                # Handle emotion library calibration
+                if self.emotion_lib and not calibration_done:
+                    if elapsed >= 6:  # After 6 seconds
+                        calibration_done = True
+                        status += " (Calibration complete)"
+                    
+                    # Get calibration progress
+                    calibration_progress = self.emotion_lib.get_calibration_percents()
+                    status += f" [Calibrating: {calibration_progress:.0f}%]"
+                
+                # Collect sample with default or calculated values
+                focus_val = 50  # Default
+                relax_val = 50  # Default
+                artifact_val = 0
+                
+                # Check for artifacts if emotion lib is available
+                if self.emotion_lib:
+                    if self.emotion_lib.is_both_sides_artifacted():
+                        artifact_val = 1
+                
+                self.data_collector.collect_sample(
+                    relaxation=relax_val,
+                    focus=focus_val,
+                    artifact=artifact_val
+                )
+                
+                # Emit progress
+                self.progress.emit(progress, status, focus_val, relax_val)
+                
+                # Sleep to maintain FPS
+                time.sleep(1.0 / self.fps)
+                
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            # Stop everything
+            self.is_recording = False
+            
+            if self.recorder:
+                self.recorder.stop()
+            
+            if self.data_collector:
+                self.data_collector.stop()
+                # Save CSV data
+                self.data_collector.save_to_csv(csv_path)
+            
+            # Stop signal if sensor is available
+            if self.sensor and hasattr(self.sensor, 'exec_command'):
+                try:
+                    self.sensor.exec_command(SensorCommand.CommandStopSignal)
+                except:
+                    pass
+            
+            # Cleanup emotion library
+            if self.emotion_lib:
+                del self.emotion_lib
+            
+            # Emit finished signal
+            self.finished.emit(video_path, csv_path)
+
 # ==============================================================================
-# 3. GUI WIDGETS
+# 4. GUI WIDGETS
 # ==============================================================================
 
 class VideoClickableFrame(QFrame):
@@ -464,12 +809,10 @@ class VideoClickableFrame(QFrame):
         self.exit_btn.hide()
         self.exit_btn.clicked.connect(self.exitFullscreen.emit)
         
-        # Add a semi-transparent overlay for controls
         self.controls_overlay = QWidget(self)
         self.controls_overlay.setStyleSheet("background-color: rgba(0, 0, 0, 0.5);")
         self.controls_overlay.hide()
         
-        # Add a play button in the center
         self.play_btn = QPushButton(self)
         self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
         self.play_btn.setIconSize(QSize(64, 64))
@@ -501,15 +844,12 @@ class VideoClickableFrame(QFrame):
             at_center = (self.width()/2 - 100 < pos.x() < self.width()/2 + 100 and 
                         self.height()/2 - 100 < pos.y() < self.height()/2 + 100)
             
-            # Position exit button at top right
             self.exit_btn.move(self.width() - self.exit_btn.width() - 20, 20)
-            self.exit_btn.setVisible(True)  # Always show exit button in fullscreen
+            self.exit_btn.setVisible(True)
             
-            # Position play button at center
             self.play_btn.move(self.width()//2 - 40, self.height()//2 - 40)
             self.play_btn.setVisible(at_center)
             
-            # Show/hide controls overlay
             self.controls_overlay.setVisible(at_bottom)
             if at_bottom:
                 self.controls_overlay.setGeometry(0, self.height() - 60, self.width(), 60)
@@ -556,7 +896,7 @@ class VideoCardWidget(QFrame):
 class VideoAnalyzerApp(QMainWindow):
     def __init__(self, cli_video=None, cli_csv=None):
         super().__init__()
-        self.setWindowTitle("Pro Video Analyzer")
+        self.setWindowTitle("Neuro Video Analyzer & Recorder")
         self.setGeometry(50, 50, 1000, 850) 
         self.setStyleSheet(STYLESHEET)
         
@@ -568,6 +908,10 @@ class VideoAnalyzerApp(QMainWindow):
         # BrainBit Data
         self.brainbit_sensor = None
         self.brainbit_worker = None
+        
+        # Recording
+        self.recording_worker = None
+        self.is_recording = False
         
         self.timer = QTimer(self)
         self.timer.setInterval(100)
@@ -592,16 +936,34 @@ class VideoAnalyzerApp(QMainWindow):
     def init_ui(self):
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
-        self.build_analyzer_ui(self.central_widget)
+        
+        # Create main tab widget
+        self.main_tabs = QTabWidget()
+        self.main_tabs.setTabPosition(QTabWidget.North)
+        
+        # Create analyzer and recorder tabs
+        self.analyzer_widget = QWidget()
+        self.recorder_widget = QWidget()
+        
+        self.build_analyzer_ui(self.analyzer_widget)
+        self.build_recorder_ui(self.recorder_widget)
+        
+        # Add tabs to main widget
+        self.main_tabs.addTab(self.analyzer_widget, "🎬 Analyzer")
+        self.main_tabs.addTab(self.recorder_widget, "📹 Recorder")
+        
+        # Set main layout
+        main_layout = QVBoxLayout(self.central_widget)
+        main_layout.addWidget(self.main_tabs)
         
     def build_analyzer_ui(self, parent_widget):
         main_layout = QVBoxLayout(parent_widget)
         main_layout.setSpacing(15)
-        main_layout.setContentsMargins(20, 10, 20, 20) # Top margin smaller to fit header
+        main_layout.setContentsMargins(20, 10, 20, 20)
 
         # 0. HEADER (BrainBit Connection)
         header_layout = QHBoxLayout()
-        header_layout.addStretch() # Push everything to the right
+        header_layout.addStretch()
         
         lbl_sn = QLabel("BrainBit SN:")
         lbl_sn.setStyleSheet("color: #888;")
@@ -726,13 +1088,157 @@ class VideoAnalyzerApp(QMainWindow):
         main_layout.addWidget(self.inner_tabs)
         self.check_enable_button()
 
-    # --- BRAINBIT METHODS ---
+    def build_recorder_ui(self, parent_widget):
+        layout = QVBoxLayout(parent_widget)
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # 1. BrainBit Connection
+        bb_group = QGroupBox("BrainBit Connection")
+        bb_layout = QVBoxLayout(bb_group)
+        
+        conn_layout = QHBoxLayout()
+        lbl_sn = QLabel("Serial Number:")
+        self.recorder_bb_serial = QLineEdit()
+        self.recorder_bb_serial.setPlaceholderText("Leave empty to auto-detect")
+        self.btn_recorder_connect = QPushButton("Connect")
+        self.btn_recorder_connect.clicked.connect(self.toggle_recorder_brainbit)
+        
+        conn_layout.addWidget(lbl_sn)
+        conn_layout.addWidget(self.recorder_bb_serial)
+        conn_layout.addWidget(self.btn_recorder_connect)
+        conn_layout.addWidget(QLabel("Status:"))
+        
+        self.lbl_recorder_bb_status = QLabel("●")
+        self.lbl_recorder_bb_status.setObjectName("BrainBitStatus")
+        self.lbl_recorder_bb_status.setStyleSheet("color: #444; font-size: 18px;")
+        conn_layout.addWidget(self.lbl_recorder_bb_status)
+        conn_layout.addStretch()
+        
+        bb_layout.addLayout(conn_layout)
+        
+        # BrainBit Info
+        info_layout = QHBoxLayout()
+        self.lbl_bb_info = QLabel("Not connected")
+        self.lbl_bb_info.setStyleSheet("color: #888; font-style: italic;")
+        info_layout.addWidget(self.lbl_bb_info)
+        info_layout.addStretch()
+        
+        self.lbl_battery = QLabel("Battery: --%")
+        info_layout.addWidget(self.lbl_battery)
+        
+        bb_layout.addLayout(info_layout)
+        layout.addWidget(bb_group)
+        
+        # 2. Recording Settings
+        settings_group = QGroupBox("Recording Settings")
+        settings_layout = QVBoxLayout(settings_group)
+        
+        # FPS Setting
+        fps_layout = QHBoxLayout()
+        fps_layout.addWidget(QLabel("Frame Rate (FPS):"))
+        self.spin_fps = QSpinBox()
+        self.spin_fps.setRange(1, 60)
+        self.spin_fps.setValue(30)
+        fps_layout.addWidget(self.spin_fps)
+        fps_layout.addStretch()
+        settings_layout.addLayout(fps_layout)
+        
+        # Monitor Selection
+        monitor_layout = QHBoxLayout()
+        monitor_layout.addWidget(QLabel("Monitor:"))
+        self.combo_monitor = QComboBox()
+        self.combo_monitor.addItems(["Primary Monitor", "Monitor 2", "Monitor 3", "Monitor 4"])
+        monitor_layout.addWidget(self.combo_monitor)
+        monitor_layout.addStretch()
+        settings_layout.addLayout(monitor_layout)
+        
+        # Output Directory
+        output_layout = QHBoxLayout()
+        output_layout.addWidget(QLabel("Output Folder:"))
+        self.recorder_output_dir = QLineEdit()
+        self.recorder_output_dir.setText(os.path.join(os.path.expanduser('~'), 'video', 'Recordings'))
+        self.btn_browse_output = QPushButton("Browse")
+        self.btn_browse_output.clicked.connect(self.browse_recording_output)
+        output_layout.addWidget(self.recorder_output_dir)
+        output_layout.addWidget(self.btn_browse_output)
+        settings_layout.addLayout(output_layout)
+        
+        # Enable emotion analysis
+        self.check_enable_emotion = QCheckBox("Enable Emotional Analysis (requires pyem-st-artifacts)")
+        self.check_enable_emotion.setChecked(True)
+        self.check_enable_emotion.setEnabled(EMOTION_LIB_AVAILABLE)
+        if not EMOTION_LIB_AVAILABLE:
+            self.check_enable_emotion.setToolTip("Install pyem-st-artifacts for emotional analysis")
+        settings_layout.addWidget(self.check_enable_emotion)
+        
+        layout.addWidget(settings_group)
+        
+        # 3. Recording Controls
+        controls_group = QGroupBox("Recording Controls")
+        controls_layout = QVBoxLayout(controls_group)
+        
+        # Status and Progress
+        self.lbl_recording_status = QLabel("Ready to record")
+        self.lbl_recording_status.setStyleSheet("font-size: 14px; font-weight: bold;")
+        controls_layout.addWidget(self.lbl_recording_status)
+        
+        self.recording_progress = QProgressBar()
+        self.recording_progress.setRange(0, 100)
+        self.recording_progress.setValue(0)
+        self.recording_progress.setVisible(False)
+        controls_layout.addWidget(self.recording_progress)
+        
+        # Metrics Display
+        metrics_layout = QHBoxLayout()
+        self.lbl_focus = QLabel("Focus: --")
+        self.lbl_relaxation = QLabel("Relaxation: --")
+        self.lbl_artifact = QLabel("Artifact: No")
+        
+        metrics_layout.addWidget(self.lbl_focus)
+        metrics_layout.addWidget(self.lbl_relaxation)
+        metrics_layout.addWidget(self.lbl_artifact)
+        metrics_layout.addStretch()
+        controls_layout.addLayout(metrics_layout)
+        
+        # Control Buttons
+        button_layout = QHBoxLayout()
+        self.btn_start_recording = QPushButton("⏺ START RECORDING")
+        self.btn_start_recording.setObjectName("RecordBtn")
+        self.btn_start_recording.clicked.connect(self.start_recording)
+        self.btn_start_recording.setEnabled(False)
+        
+        self.btn_stop_recording = QPushButton("⏹ STOP")
+        self.btn_stop_recording.setObjectName("StopBtn")
+        self.btn_stop_recording.clicked.connect(self.stop_recording)
+        self.btn_stop_recording.setEnabled(False)
+        
+        button_layout.addWidget(self.btn_start_recording)
+        button_layout.addWidget(self.btn_stop_recording)
+        button_layout.addStretch()
+        
+        controls_layout.addLayout(button_layout)
+        layout.addWidget(controls_group)
+        
+        # 4. Recent Recordings
+        recent_group = QGroupBox("Recent Recordings")
+        recent_layout = QVBoxLayout(recent_group)
+        
+        self.list_recent = QTextEdit()
+        self.list_recent.setReadOnly(True)
+        self.list_recent.setMaximumHeight(150)
+        self.list_recent.setStyleSheet("background-color: #121212; border: 1px solid #333;")
+        recent_layout.addWidget(self.list_recent)
+        
+        layout.addWidget(recent_group)
+        layout.addStretch()
+
+    # --- BRAINBIT METHODS (Analyzer Tab) ---
     def toggle_brainbit_connection(self):
         if self.brainbit_sensor is not None:
             # Disconnect
             try:
                 self.brainbit_sensor.disconnect()
-                # Clean delete of sensor object
                 del self.brainbit_sensor
             except Exception as e:
                 print(f"Disconnect error: {e}")
@@ -754,8 +1260,6 @@ class VideoAnalyzerApp(QMainWindow):
             self.brainbit_worker = BrainBitWorker(serial if serial else None)
             self.brainbit_worker.log.connect(lambda s: self.lbl_progress_status.setText(s))
             self.brainbit_worker.finished.connect(self.on_brainbit_connected)
-            # You can also hook up battery/state signals to UI labels here
-            # self.brainbit_worker.battery_signal.connect(...)
             self.brainbit_worker.start()
 
     def on_brainbit_connected(self, sensor, msg):
@@ -774,7 +1278,187 @@ class VideoAnalyzerApp(QMainWindow):
             self.lbl_progress_status.setText(msg)
             QMessageBox.warning(self, "Connection Failed", msg)
 
-    # --- UI HELPERS ---
+    # --- BRAINBIT METHODS (Recorder Tab) ---
+    def toggle_recorder_brainbit(self):
+        if hasattr(self, 'recorder_brainbit_sensor') and self.recorder_brainbit_sensor is not None:
+            # Disconnect
+            try:
+                self.recorder_brainbit_sensor.disconnect()
+                del self.recorder_brainbit_sensor
+            except Exception as e:
+                print(f"Disconnect error: {e}")
+                
+            self.recorder_brainbit_sensor = None
+            self.lbl_recorder_bb_status.setStyleSheet("color: #444;")
+            self.btn_recorder_connect.setText("Connect")
+            self.recorder_bb_serial.setEnabled(True)
+            self.lbl_bb_info.setText("Not connected")
+            self.btn_start_recording.setEnabled(False)
+        else:
+            # Connect
+            serial = self.recorder_bb_serial.text().strip()
+            
+            self.btn_recorder_connect.setEnabled(False)
+            self.btn_recorder_connect.setText("Scanning...")
+            self.lbl_recorder_bb_status.setStyleSheet("color: #FFD700;")
+            self.recorder_bb_serial.setEnabled(False)
+            
+            self.recorder_brainbit_worker = BrainBitWorker(serial if serial else None)
+            self.recorder_brainbit_worker.log.connect(lambda s: self.lbl_bb_info.setText(s))
+            self.recorder_brainbit_worker.battery_signal.connect(self.update_battery_display)
+            self.recorder_brainbit_worker.finished.connect(self.on_recorder_brainbit_connected)
+            self.recorder_brainbit_worker.start()
+
+    def on_recorder_brainbit_connected(self, sensor, msg):
+        self.btn_recorder_connect.setEnabled(True)
+        if sensor:
+            self.recorder_brainbit_sensor = sensor
+            self.lbl_recorder_bb_status.setStyleSheet("color: #00FF00;")
+            self.btn_recorder_connect.setText("Disconnect")
+            self.lbl_bb_info.setText(f"Connected: {sensor.name} ({sensor.serial_number})")
+            self.btn_start_recording.setEnabled(True)
+            
+            # Update battery display
+            if hasattr(sensor, 'batt_power'):
+                self.update_battery_display(sensor.batt_power)
+        else:
+            self.recorder_brainbit_sensor = None
+            self.lbl_recorder_bb_status.setStyleSheet("color: #FF0000;")
+            self.btn_recorder_connect.setText("Connect")
+            self.recorder_bb_serial.setEnabled(True)
+            self.lbl_bb_info.setText(msg)
+            self.btn_start_recording.setEnabled(False)
+
+    def update_battery_display(self, battery):
+        self.lbl_battery.setText(f"Battery: {battery}%")
+
+    # --- RECORDING METHODS ---
+    def browse_recording_output(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        if folder:
+            self.recorder_output_dir.setText(folder)
+
+    def start_recording(self):
+        if self.is_recording:
+            return
+            
+        # Check output directory
+        output_dir = self.recorder_output_dir.text()
+        if not output_dir:
+            QMessageBox.warning(self, "Error", "Please specify an output folder.")
+            return
+            
+        # Create directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Get recording settings
+        fps = self.spin_fps.value()
+        monitor = self.combo_monitor.currentIndex() + 1  # Convert to 1-based index
+        
+        # Start recording worker
+        self.is_recording = True
+        self.recording_worker = RecordingWorker(
+            output_dir=output_dir,
+            fps=fps,
+            monitor=monitor,
+            sensor=self.recorder_brainbit_sensor
+        )
+        
+        # Connect signals
+        self.recording_worker.progress.connect(self.update_recording_progress)
+        self.recording_worker.finished.connect(self.on_recording_finished)
+        self.recording_worker.error.connect(self.on_recording_error)
+        
+        # Update UI
+        self.btn_start_recording.setEnabled(False)
+        self.btn_stop_recording.setEnabled(True)
+        self.recording_progress.setVisible(True)
+        self.lbl_recording_status.setText("Recording started...")
+        
+        # Start worker
+        self.recording_worker.start()
+
+    def update_recording_progress(self, progress, status, focus, relaxation):
+        self.recording_progress.setValue(progress)
+        self.lbl_recording_status.setText(status)
+        
+        # Update metrics
+        self.lbl_focus.setText(f"Focus: {focus:.1f}")
+        self.lbl_relaxation.setText(f"Relaxation: {relaxation:.1f}")
+
+    def stop_recording(self):
+        if not self.is_recording or not self.recording_worker:
+            return
+            
+        self.is_recording = False
+        self.recording_worker.is_recording = False
+        
+        # Update UI immediately
+        self.btn_stop_recording.setEnabled(False)
+        self.lbl_recording_status.setText("Stopping recording...")
+
+    def on_recording_finished(self, video_path, csv_path):
+        self.is_recording = False
+        
+        # Update UI
+        self.btn_start_recording.setEnabled(True)
+        self.btn_stop_recording.setEnabled(False)
+        self.recording_progress.setVisible(False)
+        self.lbl_recording_status.setText("Recording complete!")
+        
+        # Update recent recordings list
+        self.update_recent_recordings(video_path, csv_path)
+        
+        # Show success message
+        QMessageBox.information(self, "Recording Complete", 
+                              f"Recording saved successfully!\n\n"
+                              f"Video: {os.path.basename(video_path)}\n"
+                              f"CSV Data: {os.path.basename(csv_path)}")
+        
+        # Switch to analyzer tab with the new files
+        self.main_tabs.setCurrentIndex(0)  # Switch to analyzer tab
+        self.csv_path_input.setText(csv_path)
+        self.video_path_input.setText(video_path)
+        
+        # Load and analyze the new recording
+        self.check_enable_button()
+
+    def on_recording_error(self, error_msg):
+        self.is_recording = False
+        
+        # Update UI
+        self.btn_start_recording.setEnabled(True)
+        self.btn_stop_recording.setEnabled(False)
+        self.recording_progress.setVisible(False)
+        self.lbl_recording_status.setText("Recording failed!")
+        
+        QMessageBox.critical(self, "Recording Error", f"Error during recording:\n{error_msg}")
+
+    def update_recent_recordings(self, video_path, csv_path):
+        if not hasattr(self, 'recent_recordings'):
+            self.recent_recordings = []
+        
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.recent_recordings.insert(0, {
+            'time': timestamp,
+            'video': video_path,
+            'csv': csv_path
+        })
+        
+        # Keep only last 5 recordings
+        if len(self.recent_recordings) > 5:
+            self.recent_recordings = self.recent_recordings[:5]
+        
+        # Update display
+        text = ""
+        for rec in self.recent_recordings:
+            text += f"{rec['time']}\n"
+            text += f"  Video: {os.path.basename(rec['video'])}\n"
+            text += f"  Data: {os.path.basename(rec['csv'])}\n\n"
+        
+        self.list_recent.setText(text)
+
+    # --- UI HELPERS (Analyzer Tab) ---
     def create_list_tab(self):
         w = QWidget(); l = QVBoxLayout(w); l.setContentsMargins(10,10,10,10)
         t = QTableWidget(); t.setColumnCount(4)
@@ -824,7 +1508,6 @@ class VideoAnalyzerApp(QMainWindow):
         c, v = os.path.exists(self.csv_path_input.text()), os.path.exists(self.video_path_input.text())
         self.analyze_button.setEnabled(c and v)
         if v:
-            # First try to load results relative to CSV (Project Mode)
             if self.load_existing_results(None, self.csv_path_input.text()):
                 self.populate_data()
                 self.analyze_button.setText("RE-PROCESS (Data Loaded)")
@@ -840,16 +1523,12 @@ class VideoAnalyzerApp(QMainWindow):
         if not csvs: return QMessageBox.warning(self, "Error", "No CSV file found in this folder.")
         csv_path = csvs[0]
         
-        # 1. Try to load existing segments first (Prioritize Results)
         self.csv_path_input.setText(csv_path)
         
         if self.load_existing_results(None, csv_path):
             self.populate_data()
             self.analyze_button.setText("RE-PROCESS (Data Loaded)")
-            # If we loaded successfully, we don't strictly need the raw video to view results.
-            # But we check for it anyway to populate the field.
             
-            # Optional: Check for raw video if user wants to reprocess later
             v_exts = ['.mp4', '.MP4', '.avi', '.mov', '.mkv']
             vid_path = None
             for ext in v_exts:
@@ -860,7 +1539,6 @@ class VideoAnalyzerApp(QMainWindow):
                 self.video_path_input.setText(vid_path)
                 self.analyze_button.setEnabled(True)
             else:
-                # If no raw video, we can still view results, but disable reprocessing
                 self.video_path_input.setText("")
                 self.analyze_button.setEnabled(False)
                 self.analyze_button.setText("DATA LOADED (No Source Video)")
@@ -868,8 +1546,6 @@ class VideoAnalyzerApp(QMainWindow):
             QMessageBox.information(self, "Success", "Project loaded from existing results.")
             
         else:
-            # 2. Fallback: No results found, assume new project or moved files.
-            # We NEED the video path now.
             v_exts = ['.mp4', '.MP4', '.avi', '.mov', '.mkv']
             vid_path = None
             for ext in v_exts:
@@ -976,7 +1652,6 @@ class VideoAnalyzerApp(QMainWindow):
                         p = f[:-4].split('_')
                         sid = int(p[1]); sc = float(p[2])
                         fpath = os.path.join(seg_dir, f)
-                        # Assume existing clips are valid, skip heavy probing if desired
                         with VideoFileClip(fpath) as c: dur = c.duration
                         orig_s, orig_e = 0, 0
                         if meta_df is not None and not meta_df.empty:
@@ -1055,19 +1730,16 @@ class VideoAnalyzerApp(QMainWindow):
                 return
                 
             if self.media_player.is_playing() or self.media_player.get_state() == vlc.State.Paused:
-                # Update position slider
                 position = int(self.media_player.get_position() * 1000)
                 self.position_slider.blockSignals(True)
                 self.position_slider.setValue(position)
                 self.position_slider.blockSignals(False)
                 
-                # Update time label
                 current_time = self.media_player.get_time()
                 total_time = self.media_player.get_length()
                 fmt = lambda x: f"{int(x/1000)//60:02}:{int(x/1000)%60:02}"
                 self.time_label.setText(f"{fmt(current_time)} / {fmt(total_time)}")
                 
-                # Update play/pause button state
                 is_playing = self.media_player.is_playing()
                 self.play_button.setIcon(
                     self.style().standardIcon(
@@ -1108,7 +1780,6 @@ class VideoAnalyzerApp(QMainWindow):
             self.controls_widget.hide()
             self.showFullScreen()
             self.video_frame.set_fullscreen_mode(True)
-            # Connect play button in fullscreen mode
             self.video_frame.play_btn.clicked.connect(self.play_video)
 
     def exit_fullscreen(self):
@@ -1117,7 +1788,6 @@ class VideoAnalyzerApp(QMainWindow):
         self.inner_tabs.show()
         self.controls_widget.show()
         self.video_frame.set_fullscreen_mode(False)
-        # Disconnect play button when exiting fullscreen to avoid multiple connections
         try:
             self.video_frame.play_btn.clicked.disconnect()
         except:
@@ -1133,17 +1803,27 @@ class VideoAnalyzerApp(QMainWindow):
         self.timer.stop()
         if self.media_player: self.media_player.stop(); self.media_player.release()
         
-        # Disconnect BrainBit
+        # Stop recording if active
+        if self.is_recording and self.recording_worker:
+            self.recording_worker.is_recording = False
+        
+        # Disconnect BrainBit sensors
         if self.brainbit_sensor:
             try:
                 self.brainbit_sensor.disconnect()
                 del self.brainbit_sensor
             except: pass
             
+        if hasattr(self, 'recorder_brainbit_sensor') and self.recorder_brainbit_sensor:
+            try:
+                self.recorder_brainbit_sensor.disconnect()
+                del self.recorder_brainbit_sensor
+            except: pass
+            
         super().closeEvent(event)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Neuro Video Analyzer")
+    parser = argparse.ArgumentParser(description="Neuro Video Analyzer & Recorder")
     parser.add_argument("--video", "-v", type=str, help="Path to the video file")
     parser.add_argument("--csv", "-c", type=str, help="Path to the CSV file")
     args = parser.parse_args()
